@@ -2,24 +2,62 @@ import AVFoundation
 import UIKit
 
 @MainActor
-final class AlertCoordinator {
+final class AlertCoordinator: NSObject, AVSpeechSynthesizerDelegate {
     private let speech = AVSpeechSynthesizer()
     private let haptic = UINotificationFeedbackGenerator()
-    private var lastTime = -Double.infinity
-    private var lastLevel = RiskLevel.clear
-    func reset() { lastTime = -.infinity; lastLevel = .clear; speech.stopSpeaking(at: .immediate) }
+    private var lastTimes: [String: Double] = [:]
+    private var lastLevels: [String: RiskLevel] = [:]
+    private var priorityUntil = 0.0
+    var voiceEnabled = true
+    var hapticsEnabled = true
+    override init() { super.init(); speech.delegate = self }
+    func reset() {
+        lastTimes.removeAll(); lastLevels.removeAll(); priorityUntil = 0
+        speech.stopSpeaking(at: .immediate)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
     @discardableResult
-    func emit(_ threat: ThreatSnapshot, now: Double) -> Bool {
-        let escalated = threat.level > lastLevel
-        lastLevel = threat.level
-        guard threat.level != .clear, escalated || now - lastTime > (threat.level == .danger ? 3 : 6) else { return false }
-        lastTime = now
-        haptic.notificationOccurred(threat.level == .danger ? .error : .warning)
-        if threat.level == .danger { speech.stopSpeaking(at: .immediate) }
-        guard !speech.isSpeaking else { return true }
-        let cue = AVSpeechUtterance(string: threat.level == .danger ? "Danger. Check ahead." : "Caution. Check ahead.")
-        cue.rate = 0.52
-        speech.speak(cue)
+    func emit(_ threat: ThreatSnapshot, side: CameraSide, now: Double) -> Bool {
+        let key = side.rawValue
+        let escalated = threat.level > (lastLevels[key] ?? .clear)
+        lastLevels[key] = threat.level
+        guard threat.level != .clear,
+              escalated || now - (lastTimes[key] ?? -.infinity) > (threat.level == .danger ? 3 : 7) else { return false }
+        lastTimes[key] = now
+        let whereText = side == .road ? "ahead" : "behind"
+        notify(threat.level == .danger ? "Danger \(whereText)." : "Caution \(whereText).",
+               urgent: threat.level == .danger, now: now)
         return true
+    }
+    func hazard(_ text: String) { notify(text, urgent: false, now: ProcessInfo.processInfo.systemUptime) }
+    func navigation(_ text: String) {
+        guard ProcessInfo.processInfo.systemUptime >= priorityUntil, !speech.isSpeaking else { return }
+        speak(text, interrupt: false)
+    }
+    func test() {
+        if hapticsEnabled { haptic.notificationOccurred(.warning) }
+        speak("Superbike alert test. Watch the road.", interrupt: true)
+    }
+    private func notify(_ text: String, urgent: Bool, now: Double) {
+        if hapticsEnabled { haptic.notificationOccurred(urgent ? .error : .warning) }
+        guard urgent || now >= priorityUntil else { return }
+        priorityUntil = now + (urgent ? 3 : 2)
+        speak(text, interrupt: true)
+    }
+    private func speak(_ text: String, interrupt: Bool) {
+        guard voiceEnabled else { return }
+        if interrupt { speech.stopSpeaking(at: .immediate) }
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch { /* Visual and haptic warnings remain available. */ }
+        let cue = AVSpeechUtterance(string: text); cue.rate = 0.5
+        speech.speak(cue)
+    }
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            guard self?.speech.isSpeaking == false else { return }
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 }
