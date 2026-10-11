@@ -35,7 +35,7 @@ struct ThreatSnapshot: Sendable {
     var objects: [TrackedThreat] = []
     static let clear = ThreatSnapshot()
 }
-struct GeoPoint: Codable, Sendable, Equatable, Hashable {
+struct GeoPoint: Codable, Sendable {
     let latitude: Double
     let longitude: Double
 }

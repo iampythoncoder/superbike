@@ -1,10 +1,5 @@
 # Superbike architecture and implementation
 
-> Historical design notes for the September 30 prototype. The October 4
-> integrated build replaces ReplayKit with separate camera MP4 recording and adds
-> dual cameras, continuous GPS, navigation, real hazard data and persistent history.
-> See `README.md` and `RELEASE-NOTES.md` for the current architecture and behavior.
-
 ## Refactoring decisions
 
 The previous prototype evaluated risk and motion on the main actor and used the

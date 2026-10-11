@@ -1,79 +1,68 @@
-# Superbike — integrated iPhone build
+# Superbike
 
-## Install
+SwiftUI iPhone safety research app with Swift 6 concurrency, adaptive on-device
+YOLO detection, outdoor HUD, GPS/motion telemetry, speech/haptics, ReplayKit,
+and a MapKit risk map. See `ARCHITECTURE.md` for the implementation rationale,
+integration examples, hazard-data format and remaining production work.
 
-Open `Superbike.xcodeproj` with Xcode 26.2+, choose your Apple development team in
-Signing & Capabilities, connect your unlocked iPhone, and select it as the Run
-destination. Enable Developer Mode and grant Camera and Precise Location access.
-Minimum iOS is 17. Camera and haptic validation require a real phone.
+## Run on your phone
 
-## Use
+1. Open `Superbike.xcodeproj` in Xcode.
+2. Select Superbike → Signing & Capabilities → your development team.
+3. Set a unique bundle identifier if Xcode requests it.
+4. Connect and unlock the iPhone, approve Trust, and enable Developer Mode.
+5. Choose the physical iPhone in Xcode and press Run. Requires iOS 17+.
+6. Mount upright with the rear camera facing forward. Start stationary so the
+   initial motion sample establishes the mount roll reference.
 
-1. Open the app: GPS and camera preview start immediately, before a ride.
-2. Mount upright, back camera down the road. Check the selfie inset; your body
-   must not obstruct any area you expect it to monitor behind you.
-3. Search an address with the magnifying glass. Choose Cycling (where Apple
-   returns a genuine cycling route) or explicitly choose Walking. Driving routes
-   are rejected, never relabeled as bike routes. Preview on Navigate, then tap Go.
-4. Start ride activates front/behind warnings and, by default, records both
-   available cameras. Stop REC toggles recording without ending GPS/navigation.
-5. Switch between Ride and Navigate. Camera detection and recording continue
-   while navigating inside the app. Keep the app open and the screen unlocked.
-6. End ride finalizes clips and stores the GPS track/summary. The video button
-   opens Recordings & rides, with playback and share controls. Files are also in
-   Files → On My iPhone → Superbike → Rides.
+Portrait is deliberately locked so camera, FOV and overlay coordinates agree.
+The model is bundled; inference runs offline. Map tiles may need network access.
+Open Map before starting a ride to import sourced hazard JSON. No historical
+incident database is bundled. An unmarked road does not imply a safe road.
 
-Settings include audio/haptic toggles, an alert test, automatic recording,
-permission shortcuts and live sensor status. iOS permissions or calls may
-interrupt capture; status is displayed rather than claiming protection is live.
+## Source structure
 
-## Implemented
+```text
+Superbike/
+  SuperbikeApp.swift
+  Models/       Sendable models and hazard validation
+  Engine/       Camera queue, YOLO actor, risk estimator
+  Telemetry/    Observable ride state, GPS actor, motion
+  Alerts/       Speech and haptics
+  Recording/    ReplayKit state and preview
+  Views/        HUD, threat overlays, MapKit screen
+Validation/     Deterministic algorithm and dataset checks
+Vendor/         Local Ultralytics package and license
+```
 
-- GPS starts independently from ride tracking, no 2m update suppression. Invalid
-  speeds stay unknown, stale/poor fixes are labeled, implausible jumps rejected.
-- Real simultaneous back-wide/selfie capture on supported MultiCam hardware,
-  correctly aligned unmirrored previews and independent risk tracks. Explicit
-  road-only fallback where dual capture is unavailable.
-- Color-coded object boxes; side-specific spoken/haptic danger cues; adaptive
-  total inference rate and capture frame-rate reduction under pressure.
-- Camera MP4 recording, separate road/behind streams, 60-second segments, playback
-  and sharing. No microphone audio. Stops below 200 MB free; no automatic deletion.
-- Persistent ride history/GPS tracks; local storage only unless you share clips.
-- Destination search, matching route-type verification, maneuver progress, ETA,
-  off-route recalculation, arrival, spoken navigation cues and route display.
-- Official NYC historical cyclist injury/fatality feed, local caching,
-  high-crash clusters and entry/approach alerts. Coverage/source freshness visible.
-- Sourced JSON hazard import for other regions; no false empty-map safety claim.
+## Validation
 
-## Important coverage and device limits
+Swift 6 physical-iPhone and simulator Debug builds and 12 deterministic
+risk/dataset checks passed. The app launched in the simulator; the HUD and map
+were visually inspected and the telemetry layer toggle was exercised. See
+`HUD-preview.png`. These checks do not establish camera runtime or warning accuracy.
 
-Automatic historical crash coverage currently covers **NYC only**. Import a
-verified dataset for other regions. A historical cluster is not a live crash.
-The official feed can lag; the app displays its publication/cache status.
+Run algorithm checks from this directory:
 
-Apple cycling requests were observed returning an automobile route during live
-testing. This build rejects that mismatch and explains unavailability. Explicit
-walking routes remain available but are not bike routes; dismount where required.
-Search/new directions and fresh map/data downloads need an internet connection.
+```sh
+swiftc -swift-version 6 Superbike/Models/SafetyModels.swift Superbike/Models/HazardDataset.swift Superbike/Engine/RiskEngine.swift Validation/RiskEngineChecks.swift -o /tmp/superbike-risk-checks
+/tmp/superbike-risk-checks
+```
 
-The selfie camera cannot see through a rider, clothing or mount. Rear monitoring
-means only its visible scene. Camera capture ends when the app backgrounds;
-already recorded segments are retained. Resume starts camera preview, not an
-unannounced new recording session.
+## Release status
 
-These are implemented features, not a claim of validated collision avoidance.
-The development Mac currently has no available connected iPhone, so physical
-15 Pro camera alignment, warnings, GPS reception, thermal endurance and recording
-must still be tested on that device. Begin stationary or walking without staged
-collisions. Swift compilation and simulator tests do not prove field accuracy.
+Implemented and build-verified engineering prototype; not validated production
+collision-avoidance software. Range, TTC and ride score are heuristic. Release
+still needs mount calibration, annotated-video evaluation, physical-device energy
+profiling, interruption/accessibility tests, persistence/privacy design, app icon
+and distribution setup, and real incident data. Start testing stationary or
+walking without staging collisions.
 
-## Source and validation
+## Open source
 
-See `RELEASE-NOTES.md` for this iteration and validation. Code lives under
-`Superbike/{Engine,Telemetry,Navigation,Hazards,Views,Recording,Alerts,Models}`.
-Independent deterministic harnesses are in `Validation/`.
-
-Detection uses [Ultralytics YOLO iOS](https://github.com/ultralytics/yolo-ios-app)
-and a bundled Core ML model under AGPL-3.0. Retain the vendor license and local
-patches. Apple supplies maps/directions; NYC Open Data supplies historical crash
-records. See provider source files for source URLs and clustering criteria.
+[Ultralytics YOLO iOS](https://github.com/ultralytics/yolo-ios-app) supplies the
+model and decoder under AGPL-3.0. See `Vendor/UltralyticsYOLO/LICENSE` and upstream
+terms before distribution. Disclose dependencies and AI assistance in submissions.
+The app uses Swift 6 complete concurrency checking; the vendor remains in its
+upstream language mode. Local vendor changes remove redundant image annotation
+and expose inference failure separately from a valid empty scene.
