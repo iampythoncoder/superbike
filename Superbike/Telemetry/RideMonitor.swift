@@ -235,13 +235,17 @@ final class RideMonitor: NSObject {
     private func resumeMotion() {
         guard motionManager.isDeviceMotionAvailable, !motionManager.isDeviceMotionActive else { return }
         motionManager.deviceMotionUpdateInterval = 0.1
-        motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] data, _ in
+        // The handler runs on `motionQueue`, not the main actor. Marking it @Sendable
+        // stops Swift inferring @MainActor isolation from the enclosing class, which
+        // would otherwise trip a runtime executor check and trap. State is touched
+        // only inside the main-actor Task below.
+        let handler: @Sendable (CMDeviceMotion?, Error?) -> Void = { [weak self] data, _ in
             guard let data else { return }
             let a = data.userAcceleration; let r = data.rotationRate
             let sample = MotionSample(accelerationG: sqrt(a.x*a.x+a.y*a.y+a.z*a.z),
                 rotationRate: sqrt(r.x*r.x+r.y*r.y+r.z*r.z), roll: data.attitude.roll,
                 timestamp: ProcessInfo.processInfo.systemUptime)
-            Task { @MainActor [weak self] in
+            Task { @MainActor in
                 guard let self, self.foreground else { return }
                 if self.mountRoll == nil { self.mountRoll = sample.roll }
                 var corrected = sample
@@ -253,6 +257,7 @@ final class RideMonitor: NSObject {
                 }
             }
         }
+        motionManager.startDeviceMotionUpdates(to: motionQueue, withHandler: handler)
     }
 }
 extension RideMonitor: @preconcurrency CLLocationManagerDelegate {
