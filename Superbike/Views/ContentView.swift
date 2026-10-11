@@ -1,154 +1,155 @@
 import SwiftUI
 
-extension RiskLevel {
-    var color: Color { switch self { case .clear: .green; case .caution: .yellow; case .danger: .red } }
-    var symbol: String { switch self { case .clear: "viewfinder"; case .caution: "exclamationmark.triangle.fill"; case .danger: "exclamationmark.octagon.fill" } }
-}
+enum RideScreen: String, CaseIterable { case cameras = "Ride", map = "Navigate" }
+enum RideSheet: String, Identifiable { case destination, library, settings; var id: String { rawValue } }
+
 struct ContentView: View {
     @State private var ride = RideMonitor()
-    @StateObject private var recorder = DashcamRecorder()
-    @State private var showMap = false
+    @State private var screen = RideScreen.cameras
+    @State private var sheet: RideSheet?
     @Environment(\.scenePhase) private var phase
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            GeometryReader { geometry in
-                CameraSurface(pipeline: ride.camera)
-                if ride.visionFresh {
-                    ThreatOverlay(objects: ride.threat.objects, sourceSize: ride.imageSize)
+        VStack(spacing: 12) {
+            header
+            TelemetryBar(ride: ride)
+            ZStack {
+                CameraDeck(ride: ride).opacity(screen == .cameras ? 1 : 0)
+                    .allowsHitTesting(screen == .cameras)
+                    .accessibilityHidden(screen != .cameras)
+                if screen == .map { RiskMapView(ride: ride) { sheet = .destination } }
+            }.clipShape(RoundedRectangle(cornerRadius: 24))
+            if let banner = ride.hazardBanner {
+                Label(banner, systemImage: "exclamationmark.triangle.fill")
+                    .font(.subheadline.bold()).foregroundStyle(.black).padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.orange, in: RoundedRectangle(cornerRadius: 14))
+            }
+            if ride.navigation.isNavigating || ride.navigation.canStart || ride.navigation.hasArrived {
+                NavigationBanner(ride: ride)
+            }
+            controls
+            HStack(spacing: 12) {
+                ForEach(RideScreen.allCases, id: \.self) { tab in
+                    Button { screen = tab } label: {
+                        Label(tab.rawValue, systemImage: tab == .cameras ? "video.fill" : "map.fill")
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                    }.foregroundStyle(screen == tab ? .black : .white)
+                    .background(screen == tab ? Color.white : Color.white.opacity(0.08), in: Capsule())
                 }
-            }.ignoresSafeArea()
-            LinearGradient(colors: [.black.opacity(0.8), .clear, .black.opacity(0.9)],
-                startPoint: .top, endPoint: .bottom).ignoresSafeArea().allowsHitTesting(false)
-            VStack(spacing: 14) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("SUPERBIKE").font(.system(.title2, design: .rounded, weight: .black)).tracking(2)
-                        Label(ride.isRiding ? (ride.visionFresh ? "VISION LIVE" : "VISION UNAVAILABLE") : "READY TO RIDE",
-                              systemImage: ride.visionFresh ? "circle.fill" : "circle")
-                            .font(.caption2.bold()).foregroundStyle(ride.visionFresh ? .green : .white)
-                    }
-                    Spacer()
-                    Button { showMap = true } label: {
-                        Image(systemName: "map.fill").font(.title2).frame(width: 56, height: 56)
-                    }.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
-                    .accessibilityLabel("Open risk map")
-                }
-                TelemetryBar(ride: ride)
-                HStack {
-                    Text(ride.gpsStatus)
-                    Spacer()
-                    Text(String(format: "%.2f MI", ride.distanceMeters / 1609.344))
-                }.font(.caption.monospacedDigit().bold()).foregroundStyle(.white.opacity(0.85))
-                Spacer()
-                statusCard
-                HStack(spacing: 12) {
-                    Button { recorder.toggle() } label: {
-                        Label(recorder.isRecording ? "Stop REC" : "Record", systemImage: "record.circle")
-                            .frame(maxWidth: .infinity, minHeight: 60)
-                    }.background(recorder.isRecording ? Color.red : Color.white.opacity(0.2), in: RoundedRectangle(cornerRadius: 18))
-                    .disabled(!ride.isRiding || recorder.isBusy)
-                    Button {
-                        if ride.isRiding { recorder.stop(); ride.stopRide() }
-                        else { ride.startRide() }
-                    } label: {
-                        Label(ride.isRiding ? "End ride" : "Start ride", systemImage: ride.isRiding ? "stop.fill" : "bicycle")
-                            .frame(maxWidth: .infinity, minHeight: 60)
-                    }.foregroundStyle(.black)
-                    .background(ride.isRiding ? Color.orange : Color.green, in: RoundedRectangle(cornerRadius: 18))
-                }.font(.headline).buttonStyle(.plain)
-            }.padding(16)
+                Button { sheet = .library; ride.refreshLibrary() } label: {
+                    Image(systemName: "play.rectangle.on.rectangle.fill").frame(width: 52, height: 44)
+                }.accessibilityLabel("Recordings and rides")
+            }.font(.subheadline.bold()).buttonStyle(.plain)
         }
+        .padding(.horizontal, 14).padding(.top, 6).padding(.bottom, 8)
+        .background(Color(red: 0.025, green: 0.04, blue: 0.055).ignoresSafeArea())
         .foregroundStyle(.white)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: ride.threat.level)
-        .onChange(of: phase) { _, value in
-            ride.setForeground(value == .active)
-            if value == .background { recorder.stop() }
+        .task { ride.connect() }
+        // Permission sheets briefly make the app inactive. Only backgrounding
+        // should stop sensors/recording; permission prompts must not stop setup.
+        .onChange(of: phase) { _, new in
+            if new == .background { ride.setForeground(false) }
+            else if new == .active { ride.setForeground(true) }
         }
-        .onChange(of: recorder.isRecording) { _, value in ride.setRecording(value) }
-        .onChange(of: ride.targetFPS) { _, value in if value == 0 { recorder.stop() } }
-        .fullScreenCover(isPresented: $showMap) { RiskMapView(ride: ride) }
-        .sheet(isPresented: $recorder.isShowingPreview) {
-            if let controller = recorder.previewController { ReplayPreview(controller: controller).ignoresSafeArea() }
+        .sheet(item: $sheet) { item in
+            switch item {
+            case .destination: DestinationSearchView(ride: ride) { screen = .map }
+            case .library: RideLibraryView(ride: ride)
+            case .settings: RideSettingsView(ride: ride)
+            }
         }
-        .sheet(item: Binding(get: {
-            recorder.isBusy || recorder.isShowingPreview ? nil : ride.lastSummary
-        }, set: { ride.lastSummary = $0 })) { summary in
-            VStack(spacing: 20) {
-                Image(systemName: "bicycle").font(.largeTitle).foregroundStyle(.green)
-                Text("Ride complete").font(.largeTitle.bold())
-                Text(String(format: "%.2f miles • %.0f mph max", summary.distanceMeters / 1609.344, summary.maximumSpeedMPS * 2.236936))
-                Text("\(summary.warningCount) alerts • ride score \(summary.safetyScore)/100")
-                Text("Ride score reflects detected events, not a validated measure of safety.")
-                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        .sheet(item: Binding(get: { ride.canShowSummary && sheet == nil ? ride.lastSummary : nil }, set: { ride.lastSummary = $0 })) { summary in
+            VStack(spacing: 18) {
+                Image(systemName: "checkmark.circle.fill").font(.system(size: 45)).foregroundStyle(.green)
+                Text("Ride saved").font(.largeTitle.bold())
+                Text(String(format: "%.2f mi · %.0f mph max", summary.distanceMeters / 1609.344, summary.maximumSpeedMPS * 2.236936))
+                Text("\(summary.warningCount) warnings · \(Int(summary.duration / 60)) min")
+                Text("Your route and camera clips stay on this iPhone. Find them in Recordings & rides.")
+                    .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 Button("Done") { ride.lastSummary = nil }.buttonStyle(.borderedProminent)
-            }.padding(28).presentationDetents([.medium])
+            }.padding(24).presentationDetents([.medium])
         }
-        .alert("Recording", isPresented: Binding(get: { recorder.errorMessage != nil }, set: { if !$0 { recorder.errorMessage = nil } })) {
-            Button("OK") { recorder.errorMessage = nil }
-        } message: { Text(recorder.errorMessage ?? "") }
+        .alert("Superbike", isPresented: Binding(get: { ride.errorMessage != nil }, set: { if !$0 { ride.errorMessage = nil } })) {
+            Button("OK") { ride.errorMessage = nil }
+        } message: { Text(ride.errorMessage ?? "") }
     }
-    private var statusCard: some View {
-        let color = ride.visionFresh ? ride.threat.level.color : .white
-        return HStack(spacing: 14) {
-            Image(systemName: ride.visionFresh ? ride.threat.level.symbol : "camera.fill")
-                .font(.system(size: 28, weight: .bold)).foregroundStyle(color)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(ride.visionFresh ? ride.threat.level.title : (ride.isRiding ? "WAITING FOR VISION" : "YOUR RIDE. IN FOCUS."))
-                    .font(.headline).foregroundStyle(color)
-                Text(ride.visionStatus).font(.caption).foregroundStyle(.white.opacity(0.85))
+    private var header: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("SUPERBIKE").font(.system(.title3, design: .rounded, weight: .black)).tracking(2)
+                HStack(spacing: 6) {
+                    Circle().fill(ride.gpsFresh ? Color.green : .orange).frame(width: 6, height: 6)
+                    Text(ride.gpsStatus).font(.caption2).lineLimit(1)
+                }.foregroundStyle(.white.opacity(0.8))
             }
-            Spacer(minLength: 0)
-            if let ttc = ride.threat.timeToCollision, ride.threat.level != .clear {
-                VStack { Text(String(format: "%.1fs", ttc)).font(.title2.bold().monospacedDigit()); Text("TTC EST.").font(.caption2.bold()) }
-            }
-        }.padding(18).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22))
-        .overlay(RoundedRectangle(cornerRadius: 22).stroke(color, lineWidth: 2))
+            Spacer()
+            Button { sheet = .destination; screen = .map } label: {
+                Image(systemName: "magnifyingglass").frame(width: 44, height: 44)
+            }.accessibilityLabel("Search destination")
+            Button { sheet = .settings } label: {
+                Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44)
+            }.accessibilityLabel("Settings and sensor status")
+        }.buttonStyle(.plain)
+    }
+    private var controls: some View {
+        HStack(spacing: 10) {
+            Button { ride.toggleRecording() } label: {
+                HStack(spacing: 7) {
+                    Circle().fill(ride.isRecording ? .red : .white).frame(width: 11, height: 11)
+                    Text(ride.recordingBusy ? "Saving…" : ride.isRecording ? "Stop REC" : "Record")
+                }.frame(maxWidth: .infinity, minHeight: 56)
+            }.background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 16))
+                .disabled(!ride.isRiding || ride.recordingBusy)
+            Button { ride.isRiding ? ride.stopRide() : ride.startRide() } label: {
+                Label(ride.isRiding ? "End ride" : "Start ride", systemImage: ride.isRiding ? "stop.fill" : "bicycle")
+                    .frame(maxWidth: .infinity, minHeight: 56)
+            }.foregroundStyle(.black)
+                .background(ride.isRiding ? Color.orange : Color.green, in: RoundedRectangle(cornerRadius: 16))
+                .disabled(!ride.isRiding && ride.recordingBusy)
+        }.font(.headline).buttonStyle(.plain)
     }
 }
 
-struct TelemetryBar: View {
+struct CameraDeck: View {
     let ride: RideMonitor
     var body: some View {
-        HStack(spacing: 0) {
-            metric(ride.gpsFresh ? String(format: "%.0f", ride.speedMPH) : "—", "MPH")
-            metric(String(format: "%02d:%02d", Int(ride.elapsed) / 60, Int(ride.elapsed) % 60), "TIME")
-            metric(ride.motionFresh ? "\(ride.stability)" : "—", "STABILITY")
-            metric(ride.isRiding ? "\(ride.safetyScore)" : "—", "RIDE SCORE")
-        }.padding(.vertical, 14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20))
-        .overlay(RoundedRectangle(cornerRadius: 20).stroke(.white.opacity(0.35)))
-    }
-    private func metric(_ value: String, _ label: String) -> some View {
-        VStack(spacing: 4) {
-            Text(value).font(.system(.title2, design: .rounded, weight: .heavy)).monospacedDigit().minimumScaleFactor(0.6).lineLimit(1)
-            Text(label).font(.system(size: 9, weight: .bold)).foregroundStyle(.white.opacity(0.85))
-        }.frame(maxWidth: .infinity).accessibilityElement(children: .combine)
-    }
-}
-
-struct ThreatOverlay: View {
-    let objects: [TrackedThreat]
-    let sourceSize: CGSize
-    var body: some View {
-        GeometryReader { geometry in
-            let scale = max(geometry.size.width / sourceSize.width, geometry.size.height / sourceSize.height)
-            let width = sourceSize.width * scale
-            let height = sourceSize.height * scale
-            let dx = (geometry.size.width - width) / 2
-            let dy = (geometry.size.height - height) / 2
-            ForEach(objects) { object in
-                let box = CGRect(x: object.rect.minX * width + dx, y: object.rect.minY * height + dy,
-                                 width: object.rect.width * width, height: object.rect.height * height)
-                RoundedRectangle(cornerRadius: 8).stroke(object.level.color, lineWidth: object.level == .danger ? 4 : 2)
-                    .background(object.level.color.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                    .frame(width: box.width, height: box.height).position(x: box.midX, y: box.midY)
-                Text(object.label.uppercased() + (object.estimatedDistance.map { String(format: " ~%.0fm", $0) } ?? ""))
-                    .font(.caption2.bold().monospacedDigit()).foregroundStyle(.black)
-                    .padding(5).background(object.level.color, in: RoundedRectangle(cornerRadius: 5))
-                    .position(x: min(max(box.midX, 65), geometry.size.width - 65), y: max(20, box.minY - 12))
-            }
-        }.clipped().allowsHitTesting(false).accessibilityHidden(true)
+        ZStack {
+            CameraSurface(pipeline: ride.camera, side: .road)
+            if ride.visionFresh { ThreatOverlay(objects: ride.threat.objects, sourceSize: ride.imageSize) }
+            LinearGradient(colors: [.black.opacity(0.55), .clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom)
+                .allowsHitTesting(false)
+            VStack {
+                HStack(alignment: .top) {
+                    Label("ROAD", systemImage: "arrow.up").font(.caption.bold()).padding(9)
+                        .background(.black.opacity(0.7), in: Capsule())
+                    Spacer()
+                    if ride.rearAvailable {
+                        ZStack(alignment: .bottom) {
+                            CameraSurface(pipeline: ride.camera, side: .rear)
+                            if ride.rearVisionFresh { ThreatOverlay(objects: ride.rearThreat.objects, sourceSize: ride.rearImageSize, labels: false) }
+                            Text(ride.rearVisionFresh ? "BEHIND · \(ride.rearThreat.level.shortTitle)" : "BEHIND · CONNECTING")
+                                .font(.system(size: 9, weight: .heavy)).padding(5).frame(maxWidth: .infinity)
+                                .background(.black.opacity(0.75))
+                        }.frame(width: 120, height: 160)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ride.rearVisionFresh ? ride.rearThreat.level.color : .gray, lineWidth: 2))
+                    }
+                }
+                Spacer()
+                VStack(alignment: .leading, spacing: 5) {
+                    Label(ride.visionFresh ? ride.threat.level.title : "VISION UNAVAILABLE", systemImage: ride.visionFresh ? ride.threat.level.symbol : "camera.fill")
+                        .font(.headline).foregroundStyle(ride.visionFresh ? ride.threat.level.color : .white)
+                    Text(ride.visionStatus).font(.caption).foregroundStyle(.white.opacity(0.9))
+                    if !ride.rearAvailable { Text(ride.cameraMessage).font(.caption2).foregroundStyle(.orange) }
+                    if ride.rearVisionFresh && ride.rearThreat.level != .clear {
+                        Label("\(ride.rearThreat.level.shortTitle) BEHIND", systemImage: "arrow.down")
+                            .font(.headline).foregroundStyle(ride.rearThreat.level.color)
+                    }
+                    if !ride.isRiding { Text("Camera preview • start a ride for alerts & recording").font(.caption2) }
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                    .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 14))
+            }.padding(12)
+        }.background(.black)
     }
 }
