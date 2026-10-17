@@ -17,11 +17,12 @@ struct CrashZoneBuild: Sendable {
 enum CrashZoneBuilder {
     /// Fixed 150 m cells avoid long chains of incidents turning entire cities into
     /// one zone. The circle encloses the *observed* incidents, with 25 m padding.
-    /// "Danger" means >=3 injury/fatality crashes or >=1 cyclist death in the last
-    /// 3 years; this is an explicit display threshold, not a validated probability.
+    /// "Danger" means >=3 bicycle crashes or >=1 cyclist death in the provider's
+    /// history window; this is a display threshold, not a validated probability.
     static func build(_ snapshot: CrashFeedSnapshot) -> CrashZoneBuild {
         let cellSize = 150.0
-        let longitudeScale = cos(40.72 * .pi / 180)
+        // One fixed latitude per region keeps IDs stable as the rider moves.
+        let longitudeScale = cos((snapshot.providerID.hasPrefix("ncdot") ? 35.8 : 40.72) * .pi / 180)
         struct Cell: Hashable { let x: Int; let y: Int }
         let groups = Dictionary(grouping: snapshot.incidents) { incident in
             Cell(x: Int(floor(incident.point.longitude * .pi / 180 * HazardGeometry.earthRadius * longitudeScale / cellSize)),
@@ -39,7 +40,7 @@ enum CrashZoneBuilder {
             guard let first = dates.min(), let latest = dates.max() else { continue }
             let id = stableID("\(snapshot.providerID):\(cell.x):\(cell.y)")
             let severity: RiskLevel = incidents.count >= 3 || killed > 0 ? .danger : .caution
-            let source = "NYPD · \(incidents.count) cyclist-injury/fatality crash\(incidents.count == 1 ? "" : "es") · \(injured) injured · \(killed) killed"
+            let source = "\(snapshot.sourceName) · \(incidents.count) bicycle crash\(incidents.count == 1 ? "" : "es") · \(injured) injured · \(killed) killed"
             zones.append(HazardZone(id: id, center: center, radiusMeters: radius,
                                     severity: severity, source: source, observedAt: latest))
             details[id] = CrashZoneDetails(incidentCount: incidents.count, cyclistInjuries: injured,
@@ -75,7 +76,7 @@ actor CrashFeedCache {
 
     func load(providerID: String, near point: GeoPoint, now: Date) -> CrashFeedSnapshot? {
         guard let directory else { return nil }
-        let file = directory.appendingPathComponent("crash-history-v1.json")
+        let file = directory.appendingPathComponent(fileName(providerID))
         guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 4_000_000,
               let data = try? Data(contentsOf: file),
               let snapshot = try? JSONDecoder().decode(CrashFeedSnapshot.self, from: data),
@@ -98,11 +99,15 @@ actor CrashFeedCache {
         guard let directory else { return }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try JSONEncoder().encode(snapshot).write(to: directory.appendingPathComponent("crash-history-v1.json"), options: .atomic)
+            try JSONEncoder().encode(snapshot).write(to: directory.appendingPathComponent(fileName(snapshot.providerID)), options: .atomic)
         } catch {
             // A cache failure must never turn a successful live fetch into an error.
         }
     }
 
     func build(_ snapshot: CrashFeedSnapshot) -> CrashZoneBuild { CrashZoneBuilder.build(snapshot) }
+    private func fileName(_ providerID: String) -> String {
+        let safe = providerID.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(String.init).joined()
+        return "crash-history-\(safe.prefix(100))-v1.json"
+    }
 }

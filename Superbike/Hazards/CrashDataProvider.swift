@@ -27,7 +27,12 @@ protocol CrashDataProvider: Sendable {
     var id: String { get }
     var coverageLabel: String { get }
     func coversVicinity(_ point: GeoPoint) -> Bool
+    func cacheID(near point: GeoPoint) -> String
     func fetch(near point: GeoPoint, radiusMeters: Double, now: Date) async throws -> CrashFeedSnapshot
+}
+
+extension CrashDataProvider {
+    func cacheID(near point: GeoPoint) -> String { id }
 }
 
 enum CrashDataError: LocalizedError {
@@ -38,7 +43,7 @@ enum CrashDataError: LocalizedError {
         case .unavailable: "Crash-data source could not be reached."
         case .tooLarge: "Crash-data response exceeded the safety limit."
         case .invalidResponse: "Crash-data source returned an unreadable response."
-        case .unsupportedLocation: "Automatic crash history currently covers New York City only."
+        case .unsupportedLocation: "No automatic bicycle crash source is configured for this area."
         }
     }
 }
@@ -134,7 +139,7 @@ struct NYCCrashDataProvider: CrashDataProvider {
         return Date(timeIntervalSince1970: seconds)
     }
 
-    private static func read(_ url: URL, maximumBytes: Int) async throws -> Data {
+    static func read(_ url: URL, maximumBytes: Int) async throws -> Data {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 18)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         // A bounded server-side query avoids downloading a multi-million-row dataset.
@@ -173,5 +178,110 @@ struct NYCCrashDataProvider: CrashDataProvider {
             latitude = text(.latitude).flatMap(Double.init); longitude = text(.longitude).flatMap(Double.init)
             injured = text(.injured).flatMap(Int.init); killed = text(.killed).flatMap(Int.init)
         }
+    }
+}
+
+/// The statewide layer linked by NCDOT's official Safety Data Maps page. Unlike
+/// Cary's tabular police export, it includes geocoded bicycle crashes.
+struct NCCrashDataProvider: CrashDataProvider {
+    let id = "ncdot-nonmotorist-bicyclist-v1"
+    let coverageLabel = "North Carolina · NCDOT"
+    static let layer = "https://services.arcgis.com/NuWFvHYDMVmmxMeM/arcgis/rest/services/NCDOT_NonMotoristCrashes/FeatureServer/0"
+    static let source = "https://www.ncdot.gov/initiatives-policies/safety/traffic-safety/Pages/safety-data-maps.aspx"
+
+    func coversVicinity(_ point: GeoPoint) -> Bool {
+        HazardGeometry.isValid(point) && (33.8...36.6).contains(point.latitude) && (-84.4 ... -75.4).contains(point.longitude)
+    }
+
+    func queryURL(near point: GeoPoint, radiusMeters: Double, cutoff: Date) throws -> URL {
+        let radius = min(5_000, max(500, radiusMeters))
+        let dy = radius / 111_000, dx = radius / (111_000 * cos(point.latitude * .pi / 180))
+        func n(_ value: Double) -> String { String(format: "%.6f", locale: Locale(identifier: "en_US_POSIX"), value) }
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0); formatter.dateFormat = "yyyy-MM-dd"
+        var parts = URLComponents(string: Self.layer + "/query")!
+        parts.queryItems = [
+            URLQueryItem(name: "f", value: "json"),
+            URLQueryItem(name: "where", value: "NM_Type = 'Bicyclist' AND CrashDate >= DATE '\(formatter.string(from: cutoff))'"),
+            URLQueryItem(name: "geometry", value: "\(n(point.longitude - dx)),\(n(point.latitude - dy)),\(n(point.longitude + dx)),\(n(point.latitude + dy))"),
+            URLQueryItem(name: "geometryType", value: "esriGeometryEnvelope"),
+            URLQueryItem(name: "inSR", value: "4326"),
+            URLQueryItem(name: "spatialRel", value: "esriSpatialRelIntersects"),
+            URLQueryItem(name: "outFields", value: "CrashID,CrashDate,NM_Type,NM_NumK,NM_NumA,NM_NumB,NM_NumC,Latitude,Longitude"),
+            URLQueryItem(name: "returnGeometry", value: "false"),
+            URLQueryItem(name: "orderByFields", value: "CrashDate DESC,CrashID ASC"),
+            URLQueryItem(name: "resultRecordCount", value: "2000")
+        ]
+        guard let url = parts.url else { throw CrashDataError.invalidResponse }; return url
+    }
+
+    func fetch(near point: GeoPoint, radiusMeters: Double, now: Date) async throws -> CrashFeedSnapshot {
+        guard coversVicinity(point) else { throw CrashDataError.unsupportedLocation }
+        let cutoff = Calendar(identifier: .gregorian).date(byAdding: .year, value: -5, to: now)!
+        let radius = min(5_000, max(500, radiusMeters))
+        async let metadata = publisherUpdate()
+        let data = try await NYCCrashDataProvider.read(queryURL(near: point, radiusMeters: radius, cutoff: cutoff), maximumBytes: 4_000_000)
+        let decoded = try Self.decode(data, near: point, radius: radius, cutoff: cutoff, now: now)
+        return CrashFeedSnapshot(version: 1, providerID: id, sourceName: "NCDOT · NC bicycle crashes",
+            sourceURL: Self.source, center: point, radiusMeters: radius, fetchedAt: now, historyStart: cutoff,
+            publisherUpdatedAt: await metadata, incidents: decoded.incidents,
+            truncated: decoded.truncated, rejectedRecords: decoded.rejected)
+    }
+
+    static func decode(_ data: Data, near center: GeoPoint, radius: Double, cutoff: Date, now: Date) throws
+        -> (incidents: [CrashIncident], rejected: Int, truncated: Bool) {
+        let envelope: Envelope
+        do { envelope = try JSONDecoder().decode(Envelope.self, from: data) }
+        catch { throw CrashDataError.invalidResponse }
+        guard envelope.features.count <= 2_000 else { throw CrashDataError.tooLarge }
+        var seen: Set<Int> = [], incidents: [CrashIncident] = []
+        for feature in envelope.features {
+            let row = feature.attributes
+            guard row.NM_Type == "Bicyclist", let id = row.CrashID,
+                  let ms = row.CrashDate, ms.isFinite, let lat = row.Latitude, let lon = row.Longitude else { continue }
+            let point = GeoPoint(latitude: lat, longitude: lon), date = Date(timeIntervalSince1970: ms / 1000)
+            guard NCCrashDataProvider().coversVicinity(point), date >= cutoff, date <= now,
+                  HazardGeometry.distance(center, point) <= radius else { continue }
+            // Counts describe non-motorists. Only Bicyclist records enter this feed.
+            let counts = [row.NM_NumK, row.NM_NumA, row.NM_NumB, row.NM_NumC].compactMap { $0.flatMap(Int.init) }
+            guard counts.count == 4, counts.allSatisfy({ (0..<1_000).contains($0) }), seen.insert(id).inserted else { continue }
+            incidents.append(CrashIncident(id: String(id), point: point, occurredAt: date,
+                cyclistsInjured: counts[1] + counts[2] + counts[3], cyclistsKilled: counts[0]))
+        }
+        return (incidents, envelope.features.count - incidents.count, envelope.exceededTransferLimit ?? false)
+    }
+
+    func publisherUpdate() async -> Date? {
+        guard let url = URL(string: Self.layer + "?f=json"),
+              let data = try? await NYCCrashDataProvider.read(url, maximumBytes: 1_000_000),
+              let metadata = try? JSONDecoder().decode(Metadata.self, from: data),
+              let ms = metadata.editingInfo?.dataLastEditDate, ms.isFinite else { return nil }
+        return Date(timeIntervalSince1970: ms / 1000)
+    }
+    private struct Metadata: Decodable {
+        let editingInfo: EditingInfo?
+        struct EditingInfo: Decodable { let dataLastEditDate: Double? }
+    }
+    private struct Envelope: Decodable { let features: [Feature]; let exceededTransferLimit: Bool? }
+    private struct Feature: Decodable { let attributes: Row }
+    private struct Row: Decodable {
+        let CrashID: Int?; let CrashDate: Double?; let NM_Type: String?
+        let NM_NumK: String?; let NM_NumA: String?; let NM_NumB: String?; let NM_NumC: String?
+        let Latitude: Double?; let Longitude: Double?
+    }
+}
+
+struct RegionalCrashDataProvider: CrashDataProvider {
+    let id = "regional-nc-nyc-v1"
+    let coverageLabel = "North Carolina · NCDOT / NYC · NYPD"
+    private func provider(near point: GeoPoint) -> any CrashDataProvider {
+        NCCrashDataProvider().coversVicinity(point) ? NCCrashDataProvider() : NYCCrashDataProvider()
+    }
+    func cacheID(near point: GeoPoint) -> String { provider(near: point).id }
+    func coversVicinity(_ point: GeoPoint) -> Bool {
+        NCCrashDataProvider().coversVicinity(point) || NYCCrashDataProvider().coversVicinity(point)
+    }
+    func fetch(near point: GeoPoint, radiusMeters: Double, now: Date) async throws -> CrashFeedSnapshot {
+        try await provider(near: point).fetch(near: point, radiusMeters: radiusMeters, now: now)
     }
 }

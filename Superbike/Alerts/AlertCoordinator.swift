@@ -30,9 +30,12 @@ final class AlertCoordinator: NSObject, AVSpeechSynthesizerDelegate {
         return true
     }
     func hazard(_ text: String) { notify(text, urgent: false, now: ProcessInfo.processInfo.systemUptime) }
-    func navigation(_ text: String) {
-        guard ProcessInfo.processInfo.systemUptime >= priorityUntil, !speech.isSpeaking else { return }
+    @discardableResult
+    func navigation(_ text: String) -> Bool {
+        guard voiceEnabled else { return true }
+        guard ProcessInfo.processInfo.systemUptime >= priorityUntil, !speech.isSpeaking else { return false }
         speak(text, interrupt: false)
+        return true
     }
     func test() {
         if hapticsEnabled { haptic.notificationOccurred(.warning) }

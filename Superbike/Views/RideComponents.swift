@@ -57,13 +57,22 @@ struct NavigationBanner: View {
             Image(systemName: ride.navigation.nextManeuver?.symbol ?? "flag.checkered").font(.title2.bold())
             VStack(alignment: .leading, spacing: 4) {
                 Text(ride.navigation.instruction).font(.subheadline.bold()).lineLimit(2)
-                Text("\(Int(ride.navigation.distanceToManeuverMeters)) m · \(Int(ride.navigation.remainingSeconds / 60)) min left")
+                Text("\(Int(ride.navigation.distanceToManeuverMeters)) m · \(Int(ceil(ride.navigation.remainingSeconds / 60))) min left")
                     .font(.caption).foregroundStyle(.white.opacity(0.8))
+                if let error = ride.navigation.errorMessage {
+                    Text(error).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+                }
             }
             Spacer(minLength: 0)
             if ride.navigation.canStart {
                 Button("Go") { if !ride.isRiding { ride.startRide() }; ride.navigation.start() }
                     .buttonStyle(.borderedProminent).tint(.green).foregroundStyle(.black)
+            } else if ride.navigation.isOffRoute && !ride.navigation.isRouting {
+                Button { Task { await ride.navigation.recalculate() } } label: {
+                    Image(systemName: "arrow.clockwise").frame(width: 44, height: 44)
+                }.accessibilityLabel("Retry directions")
+                Button { ride.navigation.stop() } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
+                    .accessibilityLabel("End navigation")
             } else {
                 Button { ride.navigation.stop() } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
                     .accessibilityLabel("End navigation")

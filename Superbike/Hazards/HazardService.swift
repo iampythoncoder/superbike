@@ -3,7 +3,7 @@ import Observation
 
 enum HazardCoverage: String, Sendable {
     case waitingForLocation = "Waiting for GPS"
-    case available = "NYC records nearby · NYC streets only"
+    case available = "Official bicycle crash records nearby"
     case outsideCoverage = "No automatic crash-data coverage here"
     case imported = "Imported crash history"
 }
@@ -13,10 +13,20 @@ enum HazardCoverage: String, Sendable {
 /// replacing the current area after out-of-order network completions.
 @MainActor @Observable
 final class HazardService {
+    let regional = RegionalHeatmap()
+    @ObservationIgnored private var mapPrepared = false
+    var mapZones: [HazardZone] {
+        guard regional.area != .nearby else { return zones }
+        var seen = Set<UUID>()
+        return (regional.zones + importedZones).filter { seen.insert($0.id).inserted }
+    }
+    var mapStatus: String { regional.area == .nearby ? status : regional.status }
+    var mapSourceSummary: String { regional.area == .nearby ? sourceSummary : regional.sourceSummary }
+    var mapIsLoading: Bool { regional.area == .nearby ? isLoading : regional.isLoading }
     private(set) var zones: [HazardZone] = []
     private(set) var detailsByID: [UUID: CrashZoneDetails] = [:]
     private(set) var status = "Waiting for GPS to load crash history"
-    private(set) var sourceSummary = "Automatic history: NYC only. Other areas need a sourced dataset."
+    private(set) var sourceSummary = "Automatic history: North Carolina (including Cary) and NYC."
     private(set) var coverage: HazardCoverage = .waitingForLocation
     private(set) var isLoading = false
     private(set) var lastUpdated: Date?
@@ -42,8 +52,18 @@ final class HazardService {
         let alertsEnabled: Bool
     }
 
-    init(provider: any CrashDataProvider = NYCCrashDataProvider(), cache: CrashFeedCache = CrashFeedCache()) {
+    init(provider: any CrashDataProvider = RegionalCrashDataProvider(), cache: CrashFeedCache = CrashFeedCache()) {
         self.provider = provider; self.cache = cache
+        regional.onUpdate = { [weak self] in self?.checkEntry() }
+    }
+
+    func prepareMap() {
+        guard !mapPrepared else { return }; mapPrepared = true
+        // Offer the complete local community even before location permission.
+        // Elsewhere, keep the existing GPS-centered source selection.
+        if latestFix == nil || latestFix.map({
+            (35.5...36.2).contains($0.point.latitude) && (-79.1 ... -78.2).contains($0.point.longitude)
+        }) == true { regional.select(.community) }
     }
 
     func update(location: GeoPoint, speedMPS: Double, courseDegrees: Double?,
@@ -60,8 +80,8 @@ final class HazardService {
             }
             coverage = importedZones.isEmpty ? .outsideCoverage : .imported
             status = importedZones.isEmpty ? "Crash history unavailable here — unmarked roads are not necessarily safe."
-                                          : "Using imported historical zones. Automatic feed covers NYC only."
-            sourceSummary = "Automatic history: New York City only. No local source configured."
+                                          : "Using imported historical zones."
+            sourceSummary = "Automatic history: North Carolina and NYC. No local source configured here."
         } else {
             coverage = .available
             fetchIfNeeded(near: location)
@@ -70,6 +90,7 @@ final class HazardService {
     }
 
     func refresh() {
+        if regional.area != .nearby { regional.select(regional.area, force: true); return }
         guard let fix = latestFix, provider.coversVicinity(fix.point) else { return }
         fetchIfNeeded(near: fix.point, force: true)
     }
@@ -110,9 +131,12 @@ final class HazardService {
         request?.cancel(); requestID = UUID()
         let token = requestID
         requestCenter = point; requestedAt = now; isLoading = true
-        status = "Loading official NYC crash history nearby…"
+        if let snapshot, HazardGeometry.distance(point, snapshot.center) > snapshot.radiusMeters {
+            fetchedZones = []; detailsByID = [:]; combineZones(); self.snapshot = nil
+        }
+        status = "Loading official bicycle crash history nearby…"
         request = Task { [weak self, provider, cache] in
-            if let cached = await cache.load(providerID: provider.id, near: point, now: now) {
+            if let cached = await cache.load(providerID: provider.cacheID(near: point), near: point, now: now) {
                 let clustered = await cache.build(cached)
                 if !Task.isCancelled { self?.apply(cached, build: clustered, token: token, cached: true) }
             }
@@ -151,7 +175,10 @@ final class HazardService {
         let latest = snapshot.publisherUpdatedAt.map {
             "Source updated \($0.formatted(date: .abbreviated, time: .omitted))"
         } ?? "Source update date unavailable"
-        sourceSummary = "NYC only · 3-year cyclist injury/fatality history · \(latest)."
+        sourceSummary = "\(snapshot.sourceName) · history since \(snapshot.historyStart.formatted(date: .abbreviated, time: .omitted)) · \(latest)."
+        if let newest = snapshot.incidents.map(\.occurredAt).max() {
+            sourceSummary += " Newest local record: \(newest.formatted(date: .abbreviated, time: .omitted))."
+        }
         if let published = snapshot.publisherUpdatedAt, Date().timeIntervalSince(published) > 30 * 86_400 {
             sourceSummary += " Publication is delayed."
         }
@@ -162,8 +189,10 @@ final class HazardService {
     }
 
     private func checkEntry() {
+        var seen = Set<UUID>()
+        let alertZones = (regional.zones + zones).filter { seen.insert($0.id).inserted }
         guard let fix = latestFix, fix.alertsEnabled,
-              let alert = entryEngine.evaluate(zones: zones, location: fix.point, speedMPS: fix.speed,
+              let alert = entryEngine.evaluate(zones: alertZones, location: fix.point, speedMPS: fix.speed,
                   courseDegrees: fix.course, horizontalAccuracy: fix.accuracy, timestamp: fix.timestamp) else { return }
         latestAlert = alert; onAlert?(alert)
     }

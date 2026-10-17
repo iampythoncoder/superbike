@@ -31,11 +31,11 @@ struct RideSettingsView: View {
                 Section("Crash history") {
                     Text(ride.hazards.status)
                     Text(ride.hazards.sourceSummary).font(.caption)
-                    Text("Automatic coverage currently covers NYC. Other regions require a sourced JSON dataset imported from the map. Alerts describe historical crash concentrations, not live reported crashes.").font(.caption)
+                    Text("Automatic bicycle crash history covers North Carolina, including Cary, and NYC. Other regions require a sourced JSON dataset. Alerts describe historical concentrations, not live crashes.").font(.caption)
                 }
                 Section("Storage & privacy") {
-                    Text("Separate road and behind videos are saved in 60-second segments on this phone, without microphone audio. Recording stops below 200 MB free. Nothing uploads automatically; sharing is your choice.")
-                    Text("Routes and recordings can reveal your location. Manage exported files in Files → On My iPhone → Superbike. Map searches/routes go to Apple; nearby crash queries go to the official data provider.")
+                    Text("Separate road and behind videos are saved in 60-second segments on this phone, without microphone audio. Recording stops below 200 MB free. Videos stay on the phone unless you share them.")
+                    Text("Routes and recordings can reveal your location. Manage exports in Files → On My iPhone → Superbike. Place search and walking routes go to Apple. Bicycle route endpoints go to FOSSGIS; nearby crash queries go to NCDOT or NYC Open Data.")
                 }
                 Section("About this build") {
                     Text("Warnings are estimates from visible camera objects. A silent warning system is not proof that the road is safe. Ride score is an event summary, not a certified safety rating.")

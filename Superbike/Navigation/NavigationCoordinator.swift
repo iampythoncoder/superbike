@@ -38,8 +38,8 @@ struct NavigationManeuver: Identifiable, Sendable {
 }
 
 /// All MapKit request objects remain on MainActor; immutable coordinates are shared with views.
-/// Apple supplies genuine cycling routes. An unsupported region produces an explicit error;
-/// it must never silently substitute a driving or pedestrian route for a cycling route.
+/// Cycling uses the FOSSGIS bicycle graph; walking uses MapKit. Never substitute
+/// a car route when a provider cannot serve the requested transport mode.
 @MainActor @Observable
 final class NavigationCoordinator {
     private(set) var destinations: [NavigationDestination] = []
@@ -69,7 +69,8 @@ final class NavigationCoordinator {
     var estimatedArrival: Date? { routePoints.isEmpty ? nil : Date().addingTimeInterval(remainingSeconds) }
 
     /// The app's alert arbiter decides whether a navigation cue may interrupt another alert.
-    @ObservationIgnored var onCue: (@MainActor (String) -> Void)?
+    @ObservationIgnored var onCue: (@MainActor (String) -> Bool)?
+    @ObservationIgnored private let bicycleRouter: any BicycleRouting
     @ObservationIgnored private var localSearch: MKLocalSearch?
     @ObservationIgnored private var directions: MKDirections?
     @ObservationIgnored private var searchToken = UUID()
@@ -84,6 +85,10 @@ final class NavigationCoordinator {
     @ObservationIgnored private var latestPoint: GeoPoint?
     @ObservationIgnored private var latestAccuracy = Double.infinity
     @ObservationIgnored private var arrivalBeganAt: Double?
+
+    init(bicycleRouter: any BicycleRouting = OSRMBicycleRouter()) {
+        self.bicycleRouter = bicycleRouter
+    }
 
     func search(query: String, near point: GeoPoint?) async {
         localSearch?.cancel()
@@ -139,7 +144,7 @@ final class NavigationCoordinator {
         guard canStart else { return }
         isNavigating = true; hasArrived = false; status = "Navigating · \(mode.title)"
         spokenCues = []; lastFixTimestamp = 0; arrivalBeganAt = nil
-        onCue?("Navigation started to \(destination?.title ?? "your destination"). \(nextManeuver?.instruction ?? "Follow the highlighted route.")")
+        _ = onCue?("Navigation started to \(destination?.title ?? "your destination"). \(nextManeuver?.instruction ?? "Follow the highlighted route.")")
     }
 
     /// End a trip and discard its route. A new search can start immediately.
@@ -185,13 +190,13 @@ final class NavigationCoordinator {
                 hasArrived = true; isNavigating = false; isOffRoute = false
                 remainingMeters = 0; remainingSeconds = 0; distanceToManeuverMeters = 0
                 status = "Arrived at \(destination?.title ?? "destination")"
-                onCue?("You have arrived at \(destination?.title ?? "your destination").")
+                _ = onCue?("You have arrived at \(destination?.title ?? "your destination").")
                 return
             }
         } else { arrivalBeganAt = nil }
 
         if shouldReroute, !isRouting, let destination {
-            onCue?("You are off the route. Recalculating.")
+            _ = onCue?("You are off the route. Recalculating.")
             rerouteTask?.cancel()
             rerouteTask = Task { [weak self] in
                 guard let self else { return }
@@ -220,6 +225,22 @@ final class NavigationCoordinator {
             routeName = ""; routeAdvisories = []
         }
         self.destination = destination; self.mode = mode
+        if mode == .cycling {
+            do {
+                let plan = try await bicycleRouter.route(from: origin, to: destination.point)
+                guard routeToken == token else { return }
+                try Task.checkCancellation()
+                applyBicycleRoute(plan, destination: destination, continuing: continuing)
+            } catch {
+                guard routeToken == token else { return }
+                if Task.isCancelled { isRouting = false; status = "Route request cancelled"; return }
+                errorMessage = (error as? BicycleRoutingError)?.errorDescription
+                    ?? "Bicycle directions could not load. Check your connection and retry."
+                status = continuing ? "Route update failed · previous route retained" : "No bicycle route available"
+            }
+            if routeToken == token { isRouting = false }
+            return
+        }
         let request = MKDirections.Request()
         request.source = MKMapItem(placemark: MKPlacemark(coordinate: origin.navigationCoordinate))
         request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination.point.navigationCoordinate))
@@ -258,7 +279,7 @@ final class NavigationCoordinator {
                 arrivalBeganAt = nil; spokenCues = []; lastFixTimestamp = 0
                 updateManeuver(speed: 0, announce: false)
                 status = continuing ? "Navigating · \(mode.title)" : "\(mode.title) route ready"
-                if continuing { onCue?("Route updated. \(instruction)") }
+                if continuing { _ = onCue?("Route updated. \(instruction)") }
             } catch {
                 guard routeToken == token, !Task.isCancelled else { return }
                 if case NavigationFailure.wrongTransportType = error {
@@ -276,6 +297,30 @@ final class NavigationCoordinator {
         }
     }
 
+    private func applyBicycleRoute(_ plan: BicycleRoutePlan, destination: NavigationDestination, continuing: Bool) {
+        let geometry = NavigationGeometry(points: plan.points)
+        var maneuvers: [NavigationManeuver] = [], minimum = 0.0
+        for step in plan.steps {
+            guard let match = geometry.match(step.point, from: max(0, minimum - 5)) else { continue }
+            minimum = max(minimum, match.distanceAlong)
+            maneuvers.append(NavigationManeuver(id: maneuvers.count, instruction: step.instruction,
+                distanceAlong: minimum, point: step.point))
+        }
+        if let endpoint = plan.points.last {
+            maneuvers.append(NavigationManeuver(id: maneuvers.count, instruction: "Arrive at \(destination.title)",
+                distanceAlong: geometry.distance, point: endpoint))
+        }
+        self.geometry = geometry; routePoints = plan.points; self.maneuvers = maneuvers
+        routeName = plan.name.isEmpty ? "Bicycle route" : plan.name; routeAdvisories = plan.advisories
+        expectedDuration = max(1, plan.duration); distanceAlong = 0
+        remainingMeters = geometry.distance; remainingSeconds = expectedDuration
+        offRouteMonitor = NavigationOffRouteMonitor(); isOffRoute = false
+        arrivalBeganAt = nil; spokenCues = []; lastFixTimestamp = 0
+        updateManeuver(speed: 0, announce: false)
+        status = continuing ? "Navigating · Cycling" : "Bicycle route ready · OpenStreetMap"
+        if continuing { _ = onCue?("Route updated. \(instruction)") }
+    }
+
     private func updateManeuver(speed: Double, announce: Bool = true) {
         // Keep the upcoming turn visible until it is passed. Advancing before the
         // maneuver would lose the immediate turn cue when a fast rider skips a GPS fix.
@@ -287,13 +332,15 @@ final class NavigationCoordinator {
         let stage = distanceToManeuverMeters <= max(22, speed * 3) ? "now" : "approach"
         guard distanceToManeuverMeters <= earlyDistance else { return }
         let key = "\(maneuver.id)-\(stage)"
-        guard spokenCues.insert(key).inserted else { return }
+        guard !spokenCues.contains(key) else { return }
         let instruction = maneuver.instruction
-        if stage == "now" { onCue?(instruction) }
+        let accepted: Bool
+        if stage == "now" { accepted = onCue?(instruction) ?? false }
         else {
             let rounded = max(10, Int((distanceToManeuverMeters / 10).rounded()) * 10)
-            onCue?("In \(rounded) meters, \(instruction)")
+            accepted = onCue?("In \(rounded) meters, \(instruction)") ?? false
         }
+        if accepted { spokenCues.insert(key) }
     }
 
     private func cancelSearch(token: UUID) {

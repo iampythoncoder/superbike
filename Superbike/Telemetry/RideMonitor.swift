@@ -91,7 +91,7 @@ final class RideMonitor: NSObject {
         locations.desiredAccuracy = kCLLocationAccuracyBestForNavigation
         locations.distanceFilter = kCLDistanceFilterNone
         locations.pausesLocationUpdatesAutomatically = false
-        navigation.onCue = { [weak self] message in self?.alerts.navigation(message) }
+        navigation.onCue = { [weak self] message in self?.alerts.navigation(message) ?? false }
         hazards.onAlert = { [weak self] alert in
             guard let self, self.isRiding else { return }
             self.hazardBanner = alert.message
